@@ -2,12 +2,24 @@
 // @ts-ignore
 import { connect } from 'cloudflare:sockets';
 
-// How to generate your own UUID:
-// [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
+// 建议修改为自己的 UUID
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
-let proxyIP = 'cdn.xn--b6gac.eu.org ';
+// 生成配置文件的 CF 优选 IP
+const bestCFIP = "www.gov.se"
 
+// 用于 CF 网站的代理 IP
+const proxyIPs = ["cdn.xn--b6gac.eu.org"]; // const proxyIPs = ['cdn-all.xn--b6gac.eu.org', 'cdn.xn--b6gac.eu.org', 'cdn-b100.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cdn.anycast.eu.org'];
+let proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+
+let dohURL = 'https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg='; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
+
+// v2board api environment variables
+let nodeId = ''; // 1
+
+let apiToken = ''; //abcdefghijklmnopqrstuvwxyz123456
+
+let apiHost = ''; // api.v2board.com
 
 if (!isValidUUID(userID)) {
     throw new Error('uuid is not valid');
@@ -16,20 +28,70 @@ if (!isValidUUID(userID)) {
 export default {
     /**
      * @param {import("@cloudflare/workers-types").Request} request
-     * @param {{UUID: string, PROXYIP: string}} env
+     * @param {{UID: string, PROXYIP: string, DNS_RESOLVER_URL: string, NODE_ID: int, API_HOST: string, API_TOKEN: string}} env
      * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
      * @returns {Promise<Response>}
      */
     async fetch(request, env, ctx) {
         try {
-            userID = env.UUID || userID;
+            userID = env.UID || userID;
             proxyIP = env.PROXYIP || proxyIP;
+            dohURL = env.DNS_RESOLVER_URL || dohURL;
+            nodeId = env.NODE_ID || nodeId;
+            apiToken = env.API_TOKEN || apiToken;
+            apiHost = env.API_HOST || apiHost;
             const upgradeHeader = request.headers.get('Upgrade');
             if (!upgradeHeader || upgradeHeader !== 'websocket') {
                 const url = new URL(request.url);
                 switch (url.pathname) {
-                    case '/':
-                        return new Response('Hello World!');
+                    case '/cf':
+                        return new Response(JSON.stringify(request.cf, null, 4), {
+                            status: 200,
+                            headers: {
+                                "Content-Type": "application/json;charset=utf-8",
+                            },
+                        });
+                    case '/connect': // for test connect to cf socket
+                        const [hostname, port] = ['cloudflare.com', '80'];
+                        console.log(`Connecting to ${hostname}:${port}...`);
+
+                        try {
+                            const socket = await connect({
+                                hostname: hostname,
+                                port: parseInt(port, 10),
+                            });
+
+                            const writer = socket.writable.getWriter();
+
+                            try {
+                                await writer.write(new TextEncoder().encode('GET / HTTP/1.1\r\nHost: ' + hostname + '\r\n\r\n'));
+                            } catch (writeError) {
+                                writer.releaseLock();
+                                await socket.close();
+                                return new Response(writeError.message, { status: 500 });
+                            }
+
+                            writer.releaseLock();
+
+                            const reader = socket.readable.getReader();
+                            let value;
+
+                            try {
+                                const result = await reader.read();
+                                value = result.value;
+                            } catch (readError) {
+                                await reader.releaseLock();
+                                await socket.close();
+                                return new Response(readError.message, { status: 500 });
+                            }
+
+                            await reader.releaseLock();
+                            await socket.close();
+
+                            return new Response(new TextDecoder().decode(value), { status: 200 });
+                        } catch (connectError) {
+                            return new Response(connectError.message, { status: 500 });
+                        }
                     case `/${userID}`: {
                         const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
                         return new Response(`${vlessConfig}`, {
@@ -39,8 +101,40 @@ export default {
                             }
                         });
                     }
+                    case `/${userID}/base64`: {
+                        const base64Config = getBase64Config(userID, request.headers.get('Host'));
+                        return new Response(`${base64Config}`, {
+                            status: 200,
+                            headers: {
+                                "Content-Type": "text/plain;charset=utf-8",
+                            }
+                        });
+                    }
+                    case `/${userID}/clash`: {
+                        const clashConfig = getClashConfig(userID, request.headers.get('Host'));
+                        return new Response(`${clashConfig}`, {
+                            status: 200,
+                            headers: {
+                                "Content-Type": "text/plain;charset=utf-8",
+                            }
+                        });
+                    }
+                    case `/${userID}/sb`: {
+                        const singConfig = getSingConfig(userID, request.headers.get('Host'));
+                        return new Response(`${singConfig}`, {
+                            status: 200,
+                            headers: {
+                                "Content-Type": "application/json;charset=utf-8",
+                            }
+                        });
+                    }
                     default:
-                        return new Response('Not found', { status: 404 });
+                        // return new Response('Not found', { status: 404 });
+                        // For any other path, reverse proxy to 'maimai.sega.jp' and return the original response
+                        url.hostname = 'maimai.sega.jp';
+                        url.protocol = 'https:';
+                        request = new Request(url, request);
+                        return await fetch(request);
                 }
             } else {
                 return await vlessOverWSHandler(request);
@@ -105,7 +199,7 @@ async function vlessOverWSHandler(request) {
                 rawDataIndex,
                 vlessVersion = new Uint8Array([0, 0]),
                 isUDP,
-            } = processVlessHeader(chunk, userID);
+            } = await processVlessHeader(chunk, userID);
             address = addressRemote;
             portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
                 } `;
@@ -154,6 +248,81 @@ async function vlessOverWSHandler(request) {
         webSocket: client,
     });
 }
+
+let apiResponseCache = null;
+let cacheTimeout = null;
+
+/**
+ * Fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the API response object or null if there was an error.
+ */
+async function fetchApiResponse() {
+    const requestOptions = {
+        method: 'GET',
+        redirect: 'follow'
+    };
+
+    try {
+        const response = await fetch(`https://${apiHost}/api/v1/server/UniProxy/user?node_id=${nodeId}&node_type=v2ray&token=${apiToken}`, requestOptions);
+
+        if (!response.ok) {
+            console.error('Error: Network response was not ok');
+            return null;
+        }
+        const apiResponse = await response.json();
+        apiResponseCache = apiResponse;
+
+        // Refresh the cache every 5 minutes (300000 milliseconds)
+        if (cacheTimeout) {
+            clearTimeout(cacheTimeout);
+        }
+        cacheTimeout = setTimeout(() => fetchApiResponse(), 300000);
+
+        return apiResponse;
+    } catch (error) {
+        console.error('Error:', error);
+        return null;
+    }
+}
+
+/**
+ * Returns the cached API response if it exists, otherwise fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the cached API response object or the fetched API response object, or null if there was an error.
+ */
+async function getApiResponse() {
+    if (!apiResponseCache) {
+        return await fetchApiResponse();
+    }
+    return apiResponseCache;
+}
+
+/**
+ * Checks if a given UUID is present in the API response.
+ * @param {string} targetUuid The UUID to search for.
+ * @returns {Promise<boolean>} A Promise that resolves to true if the UUID is present in the API response, false otherwise.
+ */
+async function checkUuidInApiResponse(targetUuid) {
+    // Check if any of the environment variables are empty
+    if (!nodeId || !apiToken || !apiHost) {
+        return false;
+    }
+
+    try {
+        const apiResponse = await getApiResponse();
+        if (!apiResponse) {
+            return false;
+        }
+        const isUuidInResponse = apiResponse.users.some(user => user.uuid === targetUuid);
+        return isUuidInResponse;
+    } catch (error) {
+        console.error('Error:', error);
+        return false;
+    }
+}
+
+// Usage example:
+//   const targetUuid = "65590e04-a94c-4c59-a1f2-571bce925aad";
+//   checkUuidInApiResponse(targetUuid).then(result => console.log(result));
 
 /**
  * Handles outbound TCP connections.
@@ -276,7 +445,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
  * @param {string} userID 
  * @returns 
  */
-function processVlessHeader(
+async function processVlessHeader(
     vlessBuffer,
     userID
 ) {
@@ -289,9 +458,16 @@ function processVlessHeader(
     const version = new Uint8Array(vlessBuffer.slice(0, 1));
     let isValidUser = false;
     let isUDP = false;
-    if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
-        isValidUser = true;
-    }
+    const slicedBuffer = new Uint8Array(vlessBuffer.slice(1, 17));
+    const slicedBufferString = stringify(slicedBuffer);
+
+    const uuids = userID.includes(',') ? userID.split(",") : [userID];
+
+    const checkUuidInApi = await checkUuidInApiResponse(slicedBufferString);
+    isValidUser = uuids.some(userUuid => checkUuidInApi || slicedBufferString === userUuid.trim());
+
+    console.log(`checkUuidInApi: ${await checkUuidInApiResponse(slicedBufferString)}, userID: ${slicedBufferString}`);
+
     if (!isValidUser) {
         return {
             hasError: true,
@@ -554,7 +730,7 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
     // only handle dns udp for now
     transformStream.readable.pipeTo(new WritableStream({
         async write(chunk) {
-            const resp = await fetch('https://1.1.1.1/dns-query',
+            const resp = await fetch(dohURL, // dns server url
                 {
                     method: 'POST',
                     headers: {
@@ -600,39 +776,815 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
  * @returns {string}
  */
 function getVLESSConfig(userID, hostName) {
-    const outboundConfig = {
-        "protocol": "vless",
-        "settings": {
-            "vnext": [
-                {
-                    "address": hostName,
-                    "port": 443,
-                    "users": [
-                        {
-                            "id": userID,
-                            "level": 0,
-                            "encryption": "none"
-                        }
-                    ]
-                }
-            ]
-        },
-        "streamSettings": {
-            "network": "ws",
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": hostName,
-                "allowInsecure": false
-            },
-            "wsSettings": {
-                "path": "/?ed=2048",
-                "headers": {
-                    "Host": hostName
-                }
-            }
-        },
-        "tag": "cloudflare"    
-    };
+    const vlessLink = `vless://${userID}\u0040${bestCFIP}:80?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-workers`
+    const vlessTlsLink = `vless://${userID}\u0040${bestCFIP}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-workers-TLS`
+    return `
+下面是非 TLS 端口的节点信息及节点分享链接，可使用 CF 支持的非 TLS 端口：
 
-    return JSON.stringify(outboundConfig, null, 2);
+地址：${hostName} 或 CF 优选 IP
+端口：80 或 CF 支持的非 TLS 端口
+UUID：${userID}
+传输：ws
+伪装域名：${hostName}
+路径：/?ed=2048
+
+${vlessLink}
+
+下面是 TLS 端口的节点信息及节点分享链接，可使用 CF 支持的 TLS 端口：
+
+地址：${hostName} 或 CF 优选 IP
+端口：443 或 CF 支持的 TLS 端口
+UUID：${userID}
+传输：ws
+传输层安全：TLS
+伪装域名：${hostName}
+路径：/?ed=2048
+SNI 域名：${hostName}
+
+${vlessTlsLink}
+
+Base64 通用节点订阅链接：https://${hostName}/${userID}/base64
+Clash 配置文件订阅链接：https://${hostName}/${userID}/clash
+Sing-box 配置文件订阅链接：https://${hostName}/${userID}/sb
+
+提示：部分地区有 CF 默认域名被污染的情况，除非打开客户端的 TLS 分片功能，否则无法使用 TLS 端口的节点
+如为 Pages 部署的节点则只能使用 TLS 端口的节点
+---------------------------------------------------------------
+更多教程，请关注：小御坂的破站
+`;
+}
+
+function getBase64Config(userID, hostName) {
+    const vlessLinks = btoa(`vless://${userID}\u0040${bestCFIP}:80?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-80\nvless://${userID}\u0040${bestCFIP}:8080?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-8080\nvless://${userID}\u0040${bestCFIP}:8880?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-8880\nvless://${userID}\u0040${bestCFIP}:2052?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-2052\nvless://${userID}\u0040${bestCFIP}:2082?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-2082\nvless://${userID}\u0040${bestCFIP}:2086?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-2086\nvless://${userID}\u0040${bestCFIP}:2095?encryption=none&security=none&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-2095\nvless://${userID}\u0040${bestCFIP}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-443\nvless://${userID}\u0040${bestCFIP}:2053?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-2053\nvless://${userID}\u0040${bestCFIP}:2083?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-2083\nvless://${userID}\u0040${bestCFIP}:2087?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-2087\nvless://${userID}\u0040${bestCFIP}:2096?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-2096\nvless://${userID}\u0040${bestCFIP}:8443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#Misaka-cf-vless-TLS-8443`);
+
+    return `${vlessLinks}`
+}
+
+function getClashConfig(userID, hostName) {
+    return `port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+unified-delay: true
+global-client-fingerprint: chrome
+dns:
+  enable: true
+  listen: :53
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver: 
+    - 223.5.5.5
+    - 114.114.114.114
+    - 8.8.8.8
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.0.0.1/dns-query
+    - tls://dns.google
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+proxies:
+- name: cf-vless-80
+  type: vless
+  server: ${bestCFIP}
+  port: 80
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-8080
+  type: vless
+  server: ${bestCFIP}
+  port: 8080
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-8880
+  type: vless
+  server: ${bestCFIP}
+  port: 8880
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-2052
+  type: vless
+  server: ${bestCFIP}
+  port: 2052
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-2082
+  type: vless
+  server: ${bestCFIP}
+  port: 2082
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-2086
+  type: vless
+  server: ${bestCFIP}
+  port: 2086
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-2095
+  type: vless
+  server: ${bestCFIP}
+  port: 2095
+  uuid: ${userID}
+  udp: false
+  tls: false
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-443
+  type: vless
+  server: ${bestCFIP}
+  port: 443
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-2053
+  type: vless
+  server: ${bestCFIP}
+  port: 2053
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-2083
+  type: vless
+  server: ${bestCFIP}
+  port: 2083
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-2087
+  type: vless
+  server: ${bestCFIP}
+  port: 2087
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-2096
+  type: vless
+  server: ${bestCFIP}
+  port: 2096
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+- name: cf-vless-tls-8443
+  type: vless
+  server: ${bestCFIP}
+  port: 8443
+  uuid: ${userID}
+  udp: false
+  tls: true
+  network: ws
+  servername: ${hostName}
+  ws-opts:
+    path: "/?ed=2048"
+    headers:
+      Host: ${hostName}
+
+proxy-groups:
+- name: 负载均衡
+  type: load-balance
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  proxies:
+    - cf-vless-80
+    - cf-vless-8080
+    - cf-vless-8880
+    - cf-vless-2052
+    - cf-vless-2082
+    - cf-vless-2086
+    - cf-vless-2095
+    - cf-vless-tls-443
+    - cf-vless-tls-2053
+    - cf-vless-tls-2083
+    - cf-vless-tls-2087
+    - cf-vless-tls-2096
+    - cf-vless-tls-8443
+
+- name: 自动选择
+  type: url-test
+  url: http://www.gstatic.com/generate_204
+  interval: 300
+  tolerance: 50
+  proxies:
+    - cf-vless-80
+    - cf-vless-8080
+    - cf-vless-8880
+    - cf-vless-2052
+    - cf-vless-2082
+    - cf-vless-2086
+    - cf-vless-2095
+    - cf-vless-tls-443
+    - cf-vless-tls-2053
+    - cf-vless-tls-2083
+    - cf-vless-tls-2087
+    - cf-vless-tls-2096
+    - cf-vless-tls-8443
+    
+- name: 🌍选择代理
+  type: select
+  proxies:
+    - 负载均衡
+    - 自动选择
+    - DIRECT
+    - cf-vless-80
+    - cf-vless-8080
+    - cf-vless-8880
+    - cf-vless-2052
+    - cf-vless-2082
+    - cf-vless-2086
+    - cf-vless-2095
+    - cf-vless-tls-443
+    - cf-vless-tls-2053
+    - cf-vless-tls-2083
+    - cf-vless-tls-2087
+    - cf-vless-tls-2096
+    - cf-vless-tls-8443
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🌍选择代理`
+}
+
+function getSingConfig(userID, hostName) {
+    return `{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "external_ui_download_url": "",
+      "external_ui_download_detour": "",
+      "secret": "",
+      "default_mode": "Rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true
+    }
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxydns",
+        "address": "tls://8.8.8.8/dns-query",
+        "detour": "select"
+      },
+      {
+        "tag": "localdns",
+        "address": "h3://223.5.5.5/dns-query",
+        "detour": "direct"
+      },
+      {
+        "address": "rcode://refused",
+        "tag": "block"
+      },
+      {
+        "tag": "dns_fakeip",
+        "address": "fakeip"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "localdns",
+        "disable_cache": true
+      },
+      {
+        "clash_mode": "Global",
+        "server": "proxydns"
+      },
+      {
+        "clash_mode": "Direct",
+        "server": "localdns"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "server": "localdns"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "server": "proxydns"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns_fakeip"
+      }
+    ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15",
+      "inet6_range": "fc00::/18"
+    },
+    "independent_cache": true,
+    "final": "proxydns"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "inet4_address": "172.19.0.1/30",
+      "inet6_address": "fd00::1/126",
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true,
+      "sniff_override_destination": true,
+      "domain_strategy": "prefer_ipv4"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "select",
+      "type": "selector",
+      "default": "auto",
+      "outbounds": [
+        "auto",
+        "cf-vless-80",
+        "cf-vless-8080",
+        "cf-vless-8880",
+        "cf-vless-2052",
+        "cf-vless-2082",
+        "cf-vless-2086",
+        "cf-vless-2095",
+        "cf-vless-tls-443",
+        "cf-vless-tls-2053",
+        "cf-vless-tls-2083",
+        "cf-vless-tls-2087",
+        "cf-vless-tls-2096",
+        "cf-vless-tls-8443"
+      ]
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 80,
+      "tag": "cf-vless-80",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 8080,
+      "tag": "cf-vless-8080",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 8880,
+      "tag": "cf-vless-8880",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2052,
+      "tag": "cf-vless-2052",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2082,
+      "tag": "cf-vless-2082",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2086,
+      "tag": "cf-vless-2086",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2095,
+      "tag": "cf-vless-2095",
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 443,
+      "tag": "cf-vless-tls-443",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2053,
+      "tag": "cf-vless-tls-2053",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2083,
+      "tag": "cf-vless-tls-2083",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2087,
+      "tag": "cf-vless-tls-2087",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 2096,
+      "tag": "cf-vless-tls-2096",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "server": "${bestCFIP}",
+      "server_port": 8443,
+      "tag": "cf-vless-tls-8443",
+      "tls": {
+        "enabled": true,
+        "server_name": "${hostName}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "packet_encoding": "packetaddr",
+      "transport": {
+        "headers": {
+          "Host": [
+            "${hostName}"
+          ]
+        },
+        "path": "/",
+        "type": "ws"
+      },
+      "type": "vless",
+      "uuid": "${userID}"
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "tag": "block",
+      "type": "block"
+    },
+    {
+      "tag": "dns-out",
+      "type": "dns"
+    },
+    {
+      "tag": "auto",
+      "type": "urltest",
+      "outbounds": [
+        "cf-vless-80",
+        "cf-vless-8080",
+        "cf-vless-8880",
+        "cf-vless-2052",
+        "cf-vless-2082",
+        "cf-vless-2086",
+        "cf-vless-2095",
+        "cf-vless-tls-443",
+        "cf-vless-tls-2053",
+        "cf-vless-tls-2083",
+        "cf-vless-tls-2087",
+        "cf-vless-tls-2096",
+        "cf-vless-tls-8443"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 50,
+      "interrupt_exist_connections": false
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "tag": "geosite-geolocation-!cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs",
+        "download_detour": "select",
+        "update_interval": "1d"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
+        "download_detour": "select",
+        "update_interval": "1d"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "download_detour": "select",
+        "update_interval": "1d"
+      }
+    ],
+    "auto_detect_interface": true,
+    "final": "select",
+    "rules": [
+      {
+        "outbound": "dns-out",
+        "protocol": "dns"
+      },
+      {
+        "clash_mode": "Direct",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "Global",
+        "outbound": "select"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "outbound": "select"
+      }
+    ]
+  },
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m",
+    "detour": "direct"
+  }
+}`;
 }
